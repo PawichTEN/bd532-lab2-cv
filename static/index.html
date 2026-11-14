@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BD532 PPE Live Detection</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#667085; --line:#d9dde3;
+          --ok:#12805c; --bad:#c62828; --info:#1f5fbf; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Noto Sans Thai", sans-serif; background:var(--bg); color:var(--ink); }
+  header { padding:14px 16px; border-bottom:1px solid var(--line); background:var(--card); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:2px 0 0; color:var(--muted); font-size:13px; }
+  main { display:grid; grid-template-columns: minmax(0,1fr) 300px; gap:16px; padding:16px; max-width:1200px; margin:auto; }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .stage { position:relative; background:#111; border-radius:8px; overflow:hidden; }
+  video { display:block; width:100%; height:auto; }
+  #overlay { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #banner { margin-top:10px; padding:10px; border-radius:8px; font-weight:600; text-align:center;
+            background:#eef6f2; color:var(--ok); }
+  #banner.bad { background:#fdecec; color:var(--bad); }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  select, input[type=range], input[type=file] { width:100%; }
+  .row { display:flex; gap:8px; margin-top:12px; }
+  button { flex:1; padding:9px; border-radius:8px; border:1px solid var(--line); background:#fff; font-size:14px; cursor:pointer; }
+  button.primary { background:var(--info); color:#fff; border-color:var(--info); }
+  button:disabled { opacity:.5; cursor:default; }
+  .stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:12px; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:8px; }
+  .stat b { display:block; font-size:20px; font-variant-numeric: tabular-nums; }
+  .stat span { font-size:12px; color:var(--muted); }
+  #counts { font-size:13px; margin-top:10px; min-height:40px; }
+  #log { font: 12px/1.4 ui-monospace, monospace; color:var(--muted); margin-top:10px; white-space:pre-wrap; max-height:120px; overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>PPE Live Detection</h1>
+  <p>เบราว์เซอร์ส่งเฟรมจากกล้อง → <code>det_app.py</code> (YOLO) → วาดกรอบผลลัพธ์ทับวิดีโอ · ภาพไม่ถูกบันทึกบน server</p>
+</header>
+<main>
+  <section class="card">
+    <div class="stage">
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="banner">ยังไม่เริ่ม</div>
+  </section>
+
+  <aside class="card">
+    <label for="source">แหล่งภาพ</label>
+    <select id="source">
+      <option value="camera">กล้องเว็บแคม</option>
+      <option value="file">ไฟล์วิดีโอในเครื่อง</option>
+    </select>
+    <input id="videoFile" type="file" accept="video/*" hidden>
+
+    <label for="mode">วิธีส่งเฟรม</label>
+    <select id="mode">
+      <option value="http">HTTP POST /detect (ทีละเฟรม)</option>
+      <option value="ws">WebSocket /ws/detect</option>
+    </select>
+
+    <label for="width">ความกว้างเฟรมที่ส่ง: <span id="widthVal">480</span> px</label>
+    <select id="width">
+      <option>320</option><option selected>480</option><option>640</option><option>960</option>
+    </select>
+
+    <label for="quality">JPEG quality: <span id="qualityVal">0.7</span></label>
+    <input id="quality" type="range" min="0.3" max="0.95" step="0.05" value="0.7">
+
+    <label for="conf">conf threshold: <span id="confVal">0.25</span></label>
+    <input id="conf" type="range" min="0.05" max="0.9" step="0.05" value="0.25">
+
+    <div class="row">
+      <button id="start" class="primary">Start</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><b id="fps">–</b><span>FPS (เฟรมที่ได้ผล/วินาที)</span></div>
+      <div class="stat"><b id="rtt">–</b><span>round-trip ms</span></div>
+      <div class="stat"><b id="srv">–</b><span>model ms (ฝั่ง server)</span></div>
+      <div class="stat"><b id="kb">–</b><span>KB ต่อเฟรม</span></div>
+    </div>
+    <div id="counts"></div>
+    <div id="log"></div>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");
+const grab = document.createElement("canvas"), gctx = grab.getContext("2d");
+
+let running = false, stream = null, ws = null;
+let violationNames = new Set();
+let fpsTimes = [];
+
+// ---------- ค่าที่ผู้ใช้ปรับได้ ----------
+for (const [id, out] of [["width","widthVal"],["quality","qualityVal"],["conf","confVal"]]) {
+  $(id).addEventListener("input", () => { $(out).textContent = $(id).value; });
+}
+$("source").addEventListener("change", () => { $("videoFile").hidden = $("source").value !== "file"; });
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString();
+  $("log").textContent = `[${t}] ${msg}\n` + $("log").textContent.slice(0, 2000);
+}
+
+// ---------- 1) เปิดแหล่งภาพ ----------
+async function openSource() {
+  if ($("source").value === "camera") {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 } }, audio: false });
+    video.srcObject = stream;
+  } else {
+    const f = $("videoFile").files[0];
+    if (!f) throw new Error("ยังไม่ได้เลือกไฟล์วิดีโอ");
+    video.srcObject = null;
+    video.src = URL.createObjectURL(f);
+    video.loop = true;
+  }
+  await video.play();
+  await new Promise((ok) => (video.videoWidth ? ok() : video.addEventListener("loadedmetadata", ok, { once: true })));
+}
+
+function closeSource() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+  video.pause();
+}
+
+// ---------- 2) จับเฟรม → JPEG ----------
+function captureFrame() {
+  const w = +$("width").value;
+  const h = Math.round(video.videoHeight * w / video.videoWidth);
+  grab.width = w; grab.height = h;
+  gctx.drawImage(video, 0, 0, w, h);
+  return new Promise((ok) => grab.toBlob((blob) => ok({ blob, w, h }), "image/jpeg", +$("quality").value));
+}
+
+// ---------- 3) วาดผล ----------
+function colorFor(label) {
+  if (violationNames.has(label)) return "#e53935";
+  if (label.toLowerCase() === "person") return "#42a5f5";
+  return "#2ecc71";
+}
+
+function draw(res, frame) {
+  overlay.width = overlay.clientWidth;
+  overlay.height = overlay.clientHeight;
+  const sx = overlay.width / frame.w, sy = overlay.height / frame.h;
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  octx.lineWidth = 2;
+  octx.font = "13px system-ui";
+  for (const d of res.detections) {
+    const [x1, y1, x2, y2] = d.box;
+    const c = colorFor(d.label);
+    octx.strokeStyle = c;
+    octx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
+    const text = `${d.label} ${d.conf.toFixed(2)}`;
+    const tw = octx.measureText(text).width + 6;
+    octx.fillStyle = c;
+    octx.fillRect(x1 * sx, Math.max(0, y1 * sy - 17), tw, 17);
+    octx.fillStyle = "#fff";
+    octx.fillText(text, x1 * sx + 3, Math.max(12, y1 * sy - 4));
+  }
+}
+
+function showResult(res, frame, t0) {
+  if (res.error || !res.detections) { log("server: " + JSON.stringify(res.error || res.detail || res)); return; }
+  const now = performance.now();
+  fpsTimes.push(now);
+  fpsTimes = fpsTimes.filter((t) => now - t < 2000);
+  $("fps").textContent = (fpsTimes.length / 2).toFixed(1);
+  $("rtt").textContent = Math.round(now - t0);
+  $("srv").textContent = Math.round(res.latency_ms);
+  $("kb").textContent = (frame.blob.size / 1024).toFixed(0);
+  draw(res, frame);
+
+  const parts = Object.entries(res.counts).map(([k, v]) => `${k}: ${v}`);
+  $("counts").textContent = parts.length ? parts.join(" · ") : "ไม่พบวัตถุ";
+  const b = $("banner");
+  if (res.violations > 0) { b.className = "bad"; b.textContent = `⚠️ พบการไม่สวมอุปกรณ์ ${res.violations} จุด`; }
+  else { b.className = ""; b.textContent = `✓ ไม่พบการละเมิด (${res.detections.length} วัตถุ)`; }
+}
+
+// ---------- 4a) โหมด HTTP: ส่งเฟรม → รอผล → ส่งเฟรมถัดไป ----------
+async function loopHTTP() {
+  while (running) {
+    const frame = await captureFrame();
+    const fd = new FormData();
+    fd.append("file", frame.blob, "frame.jpg");
+    const t0 = performance.now();
+    try {
+      const r = await fetch(`/detect?conf=${$("conf").value}`, { method: "POST", body: fd });
+      showResult(await r.json(), frame, t0);
+    } catch (e) {
+      log("HTTP error: " + e.message);
+      await new Promise((ok) => setTimeout(ok, 1000));
+    }
+  }
+}
+
+// ---------- 4b) โหมด WebSocket: เปิดท่อค้างไว้ ส่งเฟรมถัดไปเมื่อได้ผลเฟรมก่อน (backpressure) ----------
+function loopWS() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${proto}://${location.host}/ws/detect?conf=${$("conf").value}`);
+  let frame = null, t0 = 0;
+  async function sendNext() {
+    if (!running || ws.readyState !== WebSocket.OPEN) return;
+    frame = await captureFrame();
+    t0 = performance.now();
+    ws.send(frame.blob);
+  }
+  ws.onopen = () => { log("WebSocket เชื่อมต่อแล้ว"); sendNext(); };
+  ws.onmessage = (ev) => { showResult(JSON.parse(ev.data), frame, t0); sendNext(); };
+  ws.onerror = () => log("WebSocket error (ดู terminal ของ uvicorn)");
+  ws.onclose = (ev) => { log(`WebSocket ปิด (code ${ev.code})`); if (running) stop(); };
+}
+
+// ---------- 5) ปุ่ม ----------
+async function start() {
+  try {
+    const info = await (await fetch("/model-info")).json();
+    violationNames = new Set(info.violation_classes || []);
+    log(`model: ${info.model_version}`);
+    await openSource();
+  } catch (e) {
+    log("เริ่มไม่ได้: " + e.message);
+    return;
+  }
+  running = true;
+  fpsTimes = [];
+  $("start").disabled = true; $("stop").disabled = false;
+  for (const id of ["mode", "source", "conf"]) $(id).disabled = true;
+  if ($("mode").value === "ws") loopWS(); else loopHTTP();
+}
+
+function stop() {
+  running = false;
+  if (ws) { ws.close(); ws = null; }
+  closeSource();
+  $("start").disabled = false; $("stop").disabled = true;
+  for (const id of ["mode", "source", "conf"]) $(id).disabled = false;
+  $("banner").className = ""; $("banner").textContent = "หยุดแล้ว";
+}
+
+$("start").addEventListener("click", start);
+$("stop").addEventListener("click", stop);
+</script>
+</body>
+</html>
